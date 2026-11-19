@@ -1,0 +1,940 @@
+# =============================================================================
+# Bring Me Food: one compose file, one .env.
+#
+# What runs is chosen by COMPOSE_PROFILES in .env (see .env.example):
+#
+#   TLS strategy, pick exactly ONE:
+#     https-letsencrypt   public server, free certificates from Let's Encrypt
+#     https-custom        your own certificate files in ./tls (mkcert for local
+#                         development, or a certificate from your provider)
+#     http                plain HTTP, no certificates
+#
+#   Optional, add any:
+#     infra               local Postgres, Redis (Valkey), OpenSearch
+#                         (leave it out to use Supabase, Redis Cloud, ...)
+#     observability       local Grafana + OTLP collector
+#     backup              scheduled pg_dump of POSTGRES_HOST
+#
+#   e.g. COMPOSE_PROFILES=https-letsencrypt,infra
+#
+#   cp .env.example .env && $EDITOR .env
+#   docker compose up -d
+#
+# See README.md.
+# =============================================================================
+
+name: bmf
+
+# Fail fast if a required variable is missing (nothing reads this key).
+x-required:
+  - ${DOMAIN:?DOMAIN is required, see .env.example}
+  - ${REGISTRY:?REGISTRY is required, see .env.example}
+  - ${BACKEND_VERSION:?BACKEND_VERSION is required, see .env.example}
+  - ${FRONTEND_VERSION:?FRONTEND_VERSION is required, see .env.example}
+  - ${API_HOST:?API_HOST is required, see .env.example}
+  - ${AUTH_HOST:?AUTH_HOST is required, see .env.example}
+  - ${RESTAURANTS_HOST:?RESTAURANTS_HOST is required, see .env.example}
+  - ${ADMIN_HOST:?ADMIN_HOST is required, see .env.example}
+  - ${CLIENT_HOST:?CLIENT_HOST is required, see .env.example}
+  - ${DELIVERY_HOST:?DELIVERY_HOST is required, see .env.example}
+
+# ----------------------------- service templates ----------------------------
+# One template per tier. Replica counts come from the *_REPLICAS variables;
+# `--scale <service>=N` on the command line overrides them for one service.
+
+x-service: &service
+  restart: unless-stopped
+  networks: [app-network]
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-http: &http
+  <<: *service
+  deploy:
+    replicas: ${HTTP_REPLICAS:-1}
+
+x-ws: &ws
+  <<: *service
+  deploy:
+    replicas: ${WS_REPLICAS:-1}
+
+x-grpc: &grpc
+  <<: *service
+  deploy:
+    replicas: ${GRPC_REPLICAS:-1}
+
+x-consumer: &consumer
+  <<: *service
+  deploy:
+    replicas: ${CONSUMER_REPLICAS:-1}
+
+x-web: &web
+  <<: *service
+  deploy:
+    replicas: ${WEB_REPLICAS:-1}
+
+# ------------------------ shared environment fragments -----------------------
+
+# Connection settings. Everything except host/user/password/name is optional:
+# an empty value is passed to the service as an empty string.
+x-db-common: &db-common
+  DB_USER: ${POSTGRES_USER}
+  DB_PASSWORD: ${POSTGRES_PWD}
+  DB_NAME: ${POSTGRES_DB}
+  DB_PORT: ${POSTGRES_DB_PORT:-5432}
+  SCHEMA_PREFIX: ${POSTGRES_SCHEMA_PREFIX:-}
+  DB_QUERY_EXEC_MODE: ${POSTGRES_DB_QUERY_EXEC_MODE:-}
+  DB_MAX_OPEN_CONNS: ${POSTGRES_DB_MAX_OPEN_CONNS:-}
+  DB_MAX_IDLE_CONNS: ${POSTGRES_DB_MAX_IDLE_CONNS:-}
+  DB_CONN_MAX_IDLE_SECONDS: ${POSTGRES_DB_CONN_MAX_IDLE_SECONDS:-}
+  DB_CONN_MAX_LIFETIME_SECONDS: ${POSTGRES_DB_CONN_MAX_LIFETIME_SECONDS:-}
+
+x-db-read: &db-read
+  <<: *db-common
+  DB_HOST: ${POSTGRES_HOST_READ}
+
+x-db-write: &db-write
+  <<: *db-common
+  DB_HOST: ${POSTGRES_HOST}
+
+x-primary-db: &primary-db
+  PRIMARY_DB_HOST: ${POSTGRES_HOST}
+
+x-redis: &redis
+  REDIS_ADDR: ${REDIS_ADDR}
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  REDIS_DB: ${REDIS_DB}
+  REDIS_TLS: ${REDIS_TLS}
+
+x-broker: &broker
+  MESSAGE_BROKER: REDIS
+
+x-log: &log
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-otel: &otel
+  OTEL_COLLECTOR_URL: ${OTEL_COLLECTOR_URL:-}
+
+x-http-security: &http-security
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+  JWT_KEY: ${JWT_KEY}
+
+x-throttling: &throttling
+  THROTTLING_BURST: ${THROTTLING_BURST:-50}
+  THROTTLING_REFILL_RATE: ${THROTTLING_REFILL_RATE:-10}
+
+# mTLS between services. Certificates are mounted as secrets (see bottom).
+x-grpc-client: &grpc-client
+  GRPC_CA_CERT: /run/secrets/ca.crt
+  GRPC_CLIENT_CERT: /run/secrets/client.crt
+  GRPC_CLIENT_KEY: /run/secrets/client.key
+  GRPC_SERVER_NAME: localhost
+
+x-grpc-server: &grpc-server
+  GRPC_SERVER_CERT: /run/secrets/server.crt
+  GRPC_SERVER_KEY: /run/secrets/server.key
+  GRPC_CA_CERT: /run/secrets/ca.crt
+
+# gRPC peers resolve through Docker DNS (service name), not host ports.
+x-addr-auth: &addr-auth
+  AUTH_GRPC_SERVER_ADDRESS: auth-grpc:${AUTH_GRPC_SERVER_PORT:-50050}
+x-addr-client: &addr-client
+  CLIENT_GRPC_SERVER_ADDRESS: client-grpc:${CLIENT_GRPC_SERVER_PORT:-50051}
+x-addr-restaurant: &addr-restaurant
+  RESTAURANT_GRPC_SERVER_ADDRESS: restaurants-grpc:${RESTAURANT_GRPC_SERVER_PORT:-50052}
+x-addr-subscription: &addr-subscription
+  SUBSCRIPTION_GRPC_SERVER_ADDRESS: subscription-grpc:${SUBSCRIPTION_GRPC_SERVER_PORT:-50053}
+x-addr-billing: &addr-billing
+  BILLING_GRPC_SERVER_ADDRESS: billing-grpc:${BILLING_GRPC_SERVER_PORT:-50054}
+x-addr-notification: &addr-notification
+  NOTIFICATION_GRPC_SERVER_ADDRESS: notification-grpc:${NOTIFICATION_GRPC_SERVER_PORT:-50055}
+x-addr-rating: &addr-rating
+  RATING_GRPC_SERVER_ADDRESS: rating-grpc:${RATING_GRPC_SERVER_PORT:-50056}
+
+x-secrets-client: &secrets-client [ca.crt, client.crt, client.key]
+x-secrets-server: &secrets-server [server.crt, server.key, ca.crt]
+x-secrets-both: &secrets-both [server.crt, server.key, ca.crt, client.crt, client.key]
+
+x-traefik: &traefik
+  image: traefik:${TRAEFIK_VERSION:-v3.5}
+  restart: unless-stopped
+  networks: [app-network]
+  healthcheck:
+    test: ["CMD", "traefik", "healthcheck", "--ping"]
+    interval: 15s
+    timeout: 3s
+    retries: 3
+
+services:
+
+  # =========================== REVERSE PROXY ===========================
+  # Exactly one of the three runs, chosen by its profile. They differ only in
+  # TLS; routing comes from the labels on each service below: API paths on
+  # ${API_HOST} and one host per web app. Services without labels (gRPC,
+  # consumers) are never reachable from outside.
+
+  # --- https-letsencrypt: public certificates, issued automatically ---------
+  traefik-letsencrypt:
+    <<: *traefik
+    profiles: [https-letsencrypt]
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${APP_NETWORK:-bmf-network}
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.asdefault=true
+      - --entrypoints.websecure.http.tls.certresolver=letsencrypt
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      - --ping=true
+      - --accesslog=true
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-letsencrypt:/letsencrypt
+
+  # --- https-custom: your own certificate (mkcert, corporate CA, ...) -------
+  # Put cert.pem and key.pem in ./tls. One certificate must cover every host.
+  traefik-custom:
+    <<: *traefik
+    profiles: [https-custom]
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${APP_NETWORK:-bmf-network}
+      - --providers.file.filename=/tls/dynamic.yml
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      # Temporary redirect (302): browsers do not cache it, so switching to the
+      # `http` profile later does not leave them stuck on HTTPS.
+      - --entrypoints.web.http.redirections.entrypoint.permanent=false
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.asdefault=true
+      - --entrypoints.websecure.http.tls=true
+      - --ping=true
+      - --accesslog=true
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./tls:/tls:ro
+
+  # --- http: no TLS (local development, or TLS terminated upstream) ---------
+  traefik-http:
+    <<: *traefik
+    profiles: [http]
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${APP_NETWORK:-bmf-network}
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.asdefault=true
+      - --ping=true
+      - --accesslog=true
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+  # ======================= LOCAL INFRASTRUCTURE =======================
+  # Profile `infra`. Skip it when you use Supabase, Redis Cloud, etc.
+  # Nothing here is published to the internet; ports bind to 127.0.0.1.
+  # With it, set POSTGRES_HOST=postgres, POSTGRES_HOST_READ=postgres,
+  # REDIS_ADDR=redis:6379 and OPENSEARCH_URL=http://opensearch:9200.
+
+  # The major version is part of the data format: to change it, dump and
+  # restore, do not just bump the tag.
+  postgres:
+    <<: *service
+    profiles: [infra]
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-300}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PWD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_LOCAL_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    stop_grace_period: 60s
+
+  # Valkey is a drop-in Redis replacement (BSD licence). Redis is the message
+  # broker (streams + consumer groups), so it persists (AOF) and never evicts.
+  redis:
+    <<: *service
+    profiles: [infra]
+    image: ${REDIS_IMAGE:-valkey/valkey:8-alpine}
+    command:
+      - --requirepass
+      - ${REDIS_PASSWORD:-}
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          (valkey-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping ||
+          redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping) | grep -q PONG
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Single node, security plugin disabled: internal network only (the app uses
+  # plain http://opensearch:9200). Never publish port 9200.
+  # The HOST needs: sysctl -w vm.max_map_count=262144 (see README).
+  opensearch:
+    <<: *service
+    profiles: [infra]
+    image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:2.19.1}
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms${OPENSEARCH_HEAP:-512m} -Xmx${OPENSEARCH_HEAP:-512m}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # Profile `observability`: Grafana + Loki + Tempo + Prometheus with an OTLP
+  # endpoint. Set OTEL_COLLECTOR_URL=otel-lgtm:4317 to send telemetry here.
+  # Grafana UI: http://127.0.0.1:3000 (use an SSH tunnel on a server).
+  otel-lgtm:
+    <<: *service
+    profiles: [observability]
+    image: ${LGTM_IMAGE:-grafana/otel-lgtm:latest}
+    volumes:
+      - lgtm-data:/data
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+
+  # Profile `backup`: pg_dump (custom format) of POSTGRES_HOST every
+  # BACKUP_INTERVAL_SECONDS into ./backups, deleting files older than
+  # BACKUP_RETENTION_DAYS. Works with local or external Postgres, but these
+  # files sit on THIS machine: copy ./backups elsewhere too.
+  # Restore: pg_restore -h <host> -U <user> -d <db> --clean <file>
+  postgres-backup:
+    <<: *service
+    profiles: [backup]
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    environment:
+      PGHOST: ${POSTGRES_HOST}
+      PGPORT: ${POSTGRES_DB_PORT:-5432}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PWD}
+      PGDATABASE: ${POSTGRES_DB}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until pg_isready -q; do echo "waiting for database"; sleep 5; done
+        while true; do
+          f="/backups/$$PGDATABASE-$$(date +%Y%m%d-%H%M%S).dump"
+          if pg_dump -Fc -f "$$f"; then
+            echo "backup ok: $$f"
+          else
+            echo "backup FAILED" >&2
+            rm -f "$$f"
+          fi
+          find /backups -name '*.dump' -mtime +"$$BACKUP_RETENTION_DAYS" -delete
+          sleep "$$BACKUP_INTERVAL_SECONDS"
+        done
+    volumes:
+      - ./backups:/backups
+
+  # =========================== BACKEND: HTTP ===========================
+
+  auth:
+    <<: *http
+    image: ${REGISTRY}/auth:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *broker, *log, *http-security, *throttling]
+      PORT: "8080"
+      REDIRECT_INFO_MAP: ${REDIRECT_INFO_MAP}
+      JWE_KEY: ${JWE_KEY}
+      PERSONAL_INFO_ENCRYPTION_KEY: ${PERSONAL_INFORMATION_ENCRYPTION_KEY}
+      LOOKUP_TOKEN_ENCRYPTION_KEY: ${LOOKUP_TOKEN_ENCRYPTION_KEY}
+    secrets: *secrets-server
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.auth.loadbalancer.server.port: "8080"
+      traefik.http.routers.auth-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/api/v1/auth`) || PathPrefix(`/swagger/auth`))"
+      traefik.http.routers.auth-api.service: auth
+
+  admin:
+    <<: *http
+    image: ${REGISTRY}/admin:${BACKEND_VERSION}
+    environment:
+      <<: [*otel, *db-read, *redis, *log, *http-security, *throttling, *grpc-client,
+           *addr-auth, *addr-billing, *addr-notification, *addr-rating,
+           *addr-subscription, *addr-client]
+      PORT: "8091"
+      RESTAURANTS_GRPC_SERVER_ADDRESS: restaurants-grpc:${RESTAURANT_GRPC_SERVER_PORT:-50052}
+      REDIRECT_URL: ${ADMIN_AUTH_URL}
+      AUTH_URL: ${AUTH_URL}
+      WEB_APP_URL: ${ADMIN_WEB_APP_URL}
+      VALIDATION_EMAIL_URL: ${AUTH_URL}account-not-verified/
+      LOGGER_NO_COLOR: ${LOGGER_NO_COLOR:-false}
+    # The original prod file set GRPC_*_CERT paths but mounted no secrets here.
+    secrets: *secrets-client
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.admin.loadbalancer.server.port: "8091"
+      traefik.http.routers.admin-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/api/v1/events`) || PathPrefix(`/admin`) || PathPrefix(`/swagger/admin`))"
+      traefik.http.routers.admin-api.service: admin
+      traefik.http.routers.admin-app.rule: "Host(`${ADMIN_HOST}`) && (PathPrefix(`/admin/login`) || PathPrefix(`/admin/logout`) || PathPrefix(`/admin/refresh`) || PathPrefix(`/admin/auth`))"
+      traefik.http.routers.admin-app.service: admin
+      traefik.http.routers.admin-app.priority: "1000"
+
+  restaurants:
+    <<: *http
+    image: ${REGISTRY}/restaurants:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *broker, *log, *http-security, *throttling,
+           *grpc-client, *addr-auth, *addr-client, *addr-subscription]
+      PORT: "8081"
+      OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
+      AUTH_URL: ${AUTH_URL}
+      REDIRECT_URL: ${RESTAURANTS_AUTH_URL}
+      WEB_APP_URL: ${RESTAURANTS_WEB_APP_URL}
+      VALIDATION_EMAIL_URL: ${AUTH_URL}account-not-verified/
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      LIVEKIT_AGENT_NAME: ${LIVEKIT_AGENT_NAME}
+      MCP_TOKEN_KEY: ${MCP_TOKEN_KEY}
+      PERSONAL_INFO_ENCRYPTION_KEY: ${PERSONAL_INFORMATION_ENCRYPTION_KEY}
+    secrets: *secrets-client
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.restaurants.loadbalancer.server.port: "8081"
+      traefik.http.routers.restaurants-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/restaurants`) || PathPrefix(`/api/v1/restaurants`) || PathPrefix(`/swagger/restaurants`))"
+      traefik.http.routers.restaurants-api.service: restaurants
+      traefik.http.routers.restaurants-app.rule: "Host(`${RESTAURANTS_HOST}`) && (PathPrefix(`/restaurants/login`) || PathPrefix(`/restaurants/logout`) || PathPrefix(`/restaurants/refresh`) || PathPrefix(`/restaurants/auth`))"
+      traefik.http.routers.restaurants-app.service: restaurants
+      traefik.http.routers.restaurants-app.priority: "1000"
+
+  client:
+    <<: *http
+    image: ${REGISTRY}/client:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *broker, *log, *http-security, *throttling,
+           *grpc-client, *addr-auth, *addr-restaurant, *addr-billing]
+      PORT: "8082"
+      AUTH_URL: ${AUTH_URL}
+      REDIRECT_URL: ${CLIENT_AUTH_URL}
+      WEB_APP_URL: ${CLIENT_WEB_APP_URL}
+      VALIDATION_EMAIL_URL: ${AUTH_URL}account-not-verified/
+    secrets: *secrets-both
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.client.loadbalancer.server.port: "8082"
+      traefik.http.routers.client-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/api/v1/addresses`) || PathPrefix(`/api/v1/orders`) || PathPrefix(`/client`) || PathPrefix(`/swagger/client`))"
+      traefik.http.routers.client-api.service: client
+      traefik.http.routers.client-app.rule: "Host(`${CLIENT_HOST}`) && (PathPrefix(`/client/login`) || PathPrefix(`/client/logout`) || PathPrefix(`/client/refresh`) || PathPrefix(`/client/auth`))"
+      traefik.http.routers.client-app.service: client
+      traefik.http.routers.client-app.priority: "1000"
+
+  delivery:
+    <<: *http
+    image: ${REGISTRY}/delivery:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *http-security, *throttling, *grpc-client,
+           *addr-client, *addr-auth]
+      PORT: "8086"
+      AUTH_URL: ${AUTH_URL}
+      REDIRECT_URL: ${DELIVERY_AUTH_URL}
+      WEB_APP_URL: ${DELIVERY_WEB_APP_URL}
+      VALIDATION_EMAIL_URL: ${AUTH_URL}account-not-verified/
+    secrets: *secrets-client
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.delivery.loadbalancer.server.port: "8086"
+      traefik.http.routers.delivery-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/delivery`) || PathPrefix(`/api/v1/delivery`) || PathPrefix(`/swagger/delivery`))"
+      traefik.http.routers.delivery-api.service: delivery
+      traefik.http.routers.delivery-app.rule: "Host(`${DELIVERY_HOST}`) && (PathPrefix(`/delivery/login`) || PathPrefix(`/delivery/logout`) || PathPrefix(`/delivery/refresh`) || PathPrefix(`/delivery/auth`))"
+      traefik.http.routers.delivery-app.service: delivery
+      traefik.http.routers.delivery-app.priority: "1000"
+
+  images:
+    <<: *http
+    image: ${REGISTRY}/images:${BACKEND_VERSION}
+    environment:
+      <<: [*redis, *log, *http-security, *throttling]
+      PORT: "8085"
+      IMAGE_STORAGE_PROVIDER: FIREBASE
+      FIREBASE_CREDENTIALS_PATH: ${FIREBASE_CREDENTIALS_PATH}
+      FIREBASE_BUCKET: ${FIREBASE_BUCKET}
+      TOKEN_SIGNING_KEY: ${IMAGES_TOKEN_SIGNING_KEY}
+    volumes:
+      - ./credentials:/credentials:ro
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.images.loadbalancer.server.port: "8085"
+      traefik.http.routers.images-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/api/v1/images`) || PathPrefix(`/swagger/images`))"
+      traefik.http.routers.images-api.service: images
+
+  subscription:
+    <<: *http
+    image: ${REGISTRY}/subscription:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *broker, *log, *http-security, *throttling,
+           *grpc-client, *addr-auth]
+      PORT: "8088"
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_SUBSCRIPTION_WEBHOOK_SECRET}
+      PERSONAL_INFO_ENCRYPTION_KEY: ${PERSONAL_INFORMATION_ENCRYPTION_KEY}
+    secrets: *secrets-client
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.subscription.loadbalancer.server.port: "8088"
+      traefik.http.routers.subscription-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/api/v1/plans`) || PathPrefix(`/api/v1/subscriptions`) || PathPrefix(`/swagger/subscriptions`) || PathPrefix(`/webhooks/stripe/subscriptions`))"
+      traefik.http.routers.subscription-api.service: subscription
+
+  billing:
+    <<: *http
+    image: ${REGISTRY}/billing:${BACKEND_VERSION}
+    environment:
+      <<: [*otel, *primary-db, *db-read, *redis, *broker, *log, *http-security, *throttling,
+           *grpc-client, *addr-auth, *addr-restaurant]
+      PORT: "8089"
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_BILLING_WEBHOOK_SECRET}
+      LOGGER_NO_COLOR: ${LOGGER_NO_COLOR:-false}
+    secrets: *secrets-client
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.billing.loadbalancer.server.port: "8089"
+      traefik.http.routers.billing-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/api/v1/merchants`) || PathPrefix(`/api/v1/payments`) || PathPrefix(`/swagger/billing`) || PathPrefix(`/webhooks/stripe/billing`))"
+      traefik.http.routers.billing-api.service: billing
+
+  rating:
+    <<: *http
+    image: ${REGISTRY}/rating:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *broker, *log, *http-security, *throttling]
+      PORT: "8090"
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.rating.loadbalancer.server.port: "8090"
+      traefik.http.routers.rating-api.rule: "Host(`${API_HOST}`) && (PathPrefix(`/api/v1/ratings`) || PathPrefix(`/swagger/rating`))"
+      traefik.http.routers.rating-api.service: rating
+
+  # ======================= BACKEND: WEBSOCKET / MCP =======================
+
+  client-ws:
+    <<: *ws
+    image: ${REGISTRY}/client-ws:${BACKEND_VERSION}
+    environment:
+      <<: [*redis, *broker, *log, *http-security, *throttling]
+      PORT: "8083"
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.client-ws.loadbalancer.server.port: "8083"
+      traefik.http.routers.client-ws.rule: "Host(`${API_HOST}`) && (PathPrefix(`/ws/client`))"
+      traefik.http.routers.client-ws.service: client-ws
+
+  restaurants-ws:
+    <<: *ws
+    image: ${REGISTRY}/restaurants-ws:${BACKEND_VERSION}
+    environment:
+      <<: [*redis, *broker, *log, *http-security, *throttling]
+      PORT: "8084"
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.restaurants-ws.loadbalancer.server.port: "8084"
+      traefik.http.routers.restaurants-ws.rule: "Host(`${API_HOST}`) && (PathPrefix(`/ws/restaurants`))"
+      traefik.http.routers.restaurants-ws.service: restaurants-ws
+
+  delivery-ws:
+    <<: *ws
+    image: ${REGISTRY}/delivery-ws:${BACKEND_VERSION}
+    environment:
+      <<: [*redis, *broker, *log, *http-security, *throttling, *grpc-client, *addr-client]
+      PORT: "8087"
+    secrets: *secrets-client
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.delivery-ws.loadbalancer.server.port: "8087"
+      traefik.http.routers.delivery-ws.rule: "Host(`${API_HOST}`) && (PathPrefix(`/ws/delivery`))"
+      traefik.http.routers.delivery-ws.service: delivery-ws
+
+  restaurants-mcp:
+    <<: *http
+    image: ${REGISTRY}/restaurants-mcp:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *broker, *log, *throttling]
+      PORT: "8181"
+      MCP_TOKEN_KEY: ${MCP_TOKEN_KEY}
+      OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
+      LOGGER_NO_COLOR: ${LOGGER_NO_COLOR:-false}
+    secrets: *secrets-client
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.restaurants-mcp.loadbalancer.server.port: "8181"
+      traefik.http.routers.restaurants-mcp.rule: "Host(`${API_HOST}`) && (PathPrefix(`/mcp/restaurants`))"
+      traefik.http.routers.restaurants-mcp.service: restaurants-mcp
+      traefik.http.routers.restaurants-mcp.middlewares: restaurants-mcp-rewrite
+      traefik.http.middlewares.restaurants-mcp-rewrite.replacepathregex.regex: "^/mcp/restaurants(.*)"
+      traefik.http.middlewares.restaurants-mcp-rewrite.replacepathregex.replacement: "/mcp$${1}"
+
+  images-mcp:
+    <<: *http
+    image: ${REGISTRY}/images-mcp:${BACKEND_VERSION}
+    environment:
+      <<: [*redis, *log, *http-security, *throttling]
+      PORT: "8185"
+      IMAGE_STORAGE_PROVIDER: FIREBASE
+      FIREBASE_CREDENTIALS_PATH: ${FIREBASE_CREDENTIALS_PATH}
+      FIREBASE_BUCKET: ${FIREBASE_BUCKET}
+      TOKEN_SIGNING_KEY: ${IMAGES_TOKEN_SIGNING_KEY}
+      UNSPLASH_ACCESS_KEY: ${UNSPLASH_ACCESS_KEY}
+      MCP_TOKEN_KEY: ${MCP_TOKEN_KEY}
+    volumes:
+      - ./credentials:/credentials:ro
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.images-mcp.loadbalancer.server.port: "8185"
+      traefik.http.routers.images-mcp.rule: "Host(`${API_HOST}`) && (PathPrefix(`/mcp/images`))"
+      traefik.http.routers.images-mcp.service: images-mcp
+      traefik.http.routers.images-mcp.middlewares: images-mcp-rewrite
+      traefik.http.middlewares.images-mcp-rewrite.replacepathregex.regex: "^/mcp/images(.*)"
+      traefik.http.middlewares.images-mcp-rewrite.replacepathregex.replacement: "/mcp$${1}"
+
+  # ================ BACKEND: gRPC (internal only, no labels) ================
+
+  auth-grpc:
+    <<: *grpc
+    image: ${REGISTRY}/auth-grpc:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *log, *grpc-server]
+      PORT: ${AUTH_GRPC_SERVER_PORT:-50050}
+      JWT_KEY: ${JWT_KEY}
+      REDIRECT_INFO_MAP: ${REDIRECT_INFO_MAP}
+    secrets: *secrets-server
+
+  client-grpc:
+    <<: *grpc
+    image: ${REGISTRY}/client-grpc:${BACKEND_VERSION}
+    environment:
+      <<: [*primary-db, *db-read, *redis, *broker, *log, *grpc-server, *grpc-client,
+           *addr-auth, *addr-restaurant]
+      PORT: ${CLIENT_GRPC_SERVER_PORT:-50051}
+      PERSONAL_INFO_ENCRYPTION_KEY: ${PERSONAL_INFORMATION_ENCRYPTION_KEY}
+    secrets: *secrets-both
+
+  restaurants-grpc:
+    <<: *grpc
+    image: ${REGISTRY}/restaurants-grpc:${BACKEND_VERSION}
+    environment:
+      <<: [*db-read, *redis, *log, *grpc-server]
+      PORT: ${RESTAURANT_GRPC_SERVER_PORT:-50052}
+      OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
+    secrets: *secrets-server
+
+  subscription-grpc:
+    <<: *grpc
+    image: ${REGISTRY}/subscription-grpc:${BACKEND_VERSION}
+    environment:
+      <<: [*db-read, *redis, *log, *grpc-server]
+      PORT: ${SUBSCRIPTION_GRPC_SERVER_PORT:-50053}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      GRPC_SERVER_NAME: localhost
+    secrets: *secrets-server
+
+  billing-grpc:
+    <<: *grpc
+    image: ${REGISTRY}/billing-grpc:${BACKEND_VERSION}
+    environment:
+      <<: [*db-read, *redis, *log, *grpc-server]
+      PORT: ${BILLING_GRPC_SERVER_PORT:-50054}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      GRPC_SERVER_NAME: localhost
+    secrets: *secrets-server
+
+  notification-grpc:
+    <<: *grpc
+    image: ${REGISTRY}/notification-grpc:${BACKEND_VERSION}
+    environment:
+      <<: [*otel, *db-read, *log, *grpc-server]
+      PORT: ${NOTIFICATION_GRPC_SERVER_PORT:-50055}
+      LOGGER_NO_COLOR: ${LOGGER_NO_COLOR:-false}
+    secrets: *secrets-server
+
+  rating-grpc:
+    <<: *grpc
+    image: ${REGISTRY}/rating-grpc:${BACKEND_VERSION}
+    environment:
+      <<: [*otel, *db-read, *log, *grpc-server]
+      PORT: ${RATING_GRPC_SERVER_PORT:-50056}
+      LOGGER_NO_COLOR: ${LOGGER_NO_COLOR:-false}
+    secrets: *secrets-server
+
+  # ============== BACKEND: CONSUMERS (internal only, no labels) ==============
+  # Redis consumer groups are versioned by CONSUMERS_VERSION.
+
+  address-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/address-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log]
+      CONSUMER_GROUP: addresses_consumer${CONSUMERS_VERSION:-}
+
+  order-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/order-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log, *grpc-client, *addr-auth]
+      ORDER_COMMANDS_CONSUMER_GROUP: order_commands_consumer${CONSUMERS_VERSION:-}
+      RATING_EVENTS_CONSUMER_GROUP: rating_events_consumer${CONSUMERS_VERSION:-}
+      BILLING_EVENTS_CONSUMER_GROUP: billing_events_consumer${CONSUMERS_VERSION:-}
+    secrets: *secrets-client
+
+  restaurants-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/restaurants-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log, *grpc-client, *addr-client]
+      OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
+      COMMANDS_CONSUMER_GROUP: restaurants_commands_consumer${CONSUMERS_VERSION:-}
+      EVENTS_CONSUMER_GROUP: restaurants_events_consumer${CONSUMERS_VERSION:-}
+      RATING_EVENTS_CONSUMER_GROUP: restaurants_rating_events_consumer${CONSUMERS_VERSION:-}
+      MENU_AGGREGATOR_CONSUMER_GROUP: menu_aggregator_consumer${CONSUMERS_VERSION:-}
+    secrets: *secrets-client
+
+  menu-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/menu-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log]
+      MENU_CONSUMER_GROUP: menus_consumer${CONSUMERS_VERSION:-}
+      MENU_ITEM_CONSUMER_GROUP: menu_items_consumer${CONSUMERS_VERSION:-}
+
+  auth-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/auth-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log]
+      PORT: "8080"
+      AUTH_CONSUMER_GROUP: auth_consumer${CONSUMERS_VERSION:-}
+      USER_CONSUMER_GROUP: users_consumer${CONSUMERS_VERSION:-}
+
+  notification-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/notification-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log, *grpc-client, *addr-auth]
+      PORT: "8080"
+      SMTP_SERVER: ${SMTP_SERVER}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      SMTP_FROM: ${SMTP_FROM}
+      PASSWORD_RESET_REDIRECT_URL: ${AUTH_URL}reset-password/
+      EMAIL_VALIDATION_REDIRECT_URL: ${AUTH_URL}email-validation/
+      RESTAURANTS_PORTAL_URL: ${RESTAURANTS_WEB_APP_URL}
+      EMAIL_COMMANDS_CONSUMER_GROUP: email_commands_consumer${CONSUMERS_VERSION:-}
+      USER_EVENTS_CONSUMER_GROUP: user_events_consumer${CONSUMERS_VERSION:-}
+      JWE_KEY: ${JWE_KEY}
+      ENCRYPTION_KEY: ${PERSONAL_INFORMATION_ENCRYPTION_KEY}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+    secrets: *secrets-client
+
+  subscription-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/subscription-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log, *grpc-client, *addr-auth]
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_COMMANDS_CONSUMER_GROUP: stripe_commands_subscription_consumer${CONSUMERS_VERSION:-}
+      DB_COMMANDS_CONSUMER_GROUP: db_commands_subscription_consumer${CONSUMERS_VERSION:-}
+      SUBSCRIPTION_EVENTS_CONSUMER_GROUP: subscription_events_consumer${CONSUMERS_VERSION:-}
+      ENCRYPTION_KEY: ${PERSONAL_INFORMATION_ENCRYPTION_KEY}
+    secrets: *secrets-client
+
+  billing-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/billing-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*otel, *db-write, *redis, *broker, *log, *grpc-client, *addr-client, *addr-auth]
+      PERSONAL_INFO_ENCRYPTION_KEY: ${PERSONAL_INFORMATION_ENCRYPTION_KEY}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      BILLING_COMMANDS_CONSUMER_GROUP: billing_commands_consumer${CONSUMERS_VERSION:-}
+      ORDER_EVENTS_CONSUMER_GROUP: order_events_consumer${CONSUMERS_VERSION:-}
+      LOGGER_NO_COLOR: ${LOGGER_NO_COLOR:-false}
+    secrets: *secrets-client
+
+  rating-consumer:
+    <<: *consumer
+    image: ${REGISTRY}/rating-consumer:${BACKEND_VERSION}
+    environment:
+      <<: [*db-write, *redis, *broker, *log]
+      CONSUMER_GROUP: rating_consumer${CONSUMERS_VERSION:-}
+
+  # ===================== FRONTEND (nginx, port 80) =====================
+  # Compose names end in -web to match the registry images and to avoid
+  # clashing with the backend services of the same name. Each app is served
+  # on its own host (${AUTH_HOST}, ${RESTAURANTS_HOST}, ...). VITE_* values
+  # are passed as container environment, exactly as in the dev compose file.
+
+  auth-web:
+    <<: *web
+    image: ${REGISTRY}/auth-web:${FRONTEND_VERSION}
+    environment:
+      VITE_OTEL_ENDPOINT: ${VITE_OTEL_ENDPOINT}
+      VITE_CLIENT_LOGIN_URL: ${VITE_CLIENT_LOGIN_URL}
+      VITE_RESTAURANTS_LOGIN_URL: ${VITE_RESTAURANTS_LOGIN_URL}
+      VITE_DELIVERY_LOGIN_URL: ${VITE_DELIVERY_LOGIN_URL}
+      VITE_BE_ENDPOINT: ${VITE_AUTH_ENDPOINT}
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.auth-web.loadbalancer.server.port: "80"
+      traefik.http.routers.auth-web.rule: "Host(`${AUTH_HOST}`)"
+      traefik.http.routers.auth-web.service: auth-web
+
+  restaurants-web:
+    <<: *web
+    image: ${REGISTRY}/restaurants-web:${FRONTEND_VERSION}
+    environment:
+      VITE_AUTH_ENDPOINT: ${VITE_AUTH_ENDPOINT}
+      VITE_IMAGES_ENDPOINT: ${VITE_IMAGES_ENDPOINT}
+      VITE_RESTAURANTS_ENDPOINT: ${VITE_RESTAURANTS_ENDPOINT}
+      VITE_SUBSCRIPTION_ENDPOINT: ${VITE_SUBSCRIPTION_ENDPOINT}
+      VITE_BILLING_ENDPOINT: ${VITE_BILLING_ENDPOINT}
+      VITE_LOGIN_URL: ${VITE_RESTAURANTS_LOGIN_URL}
+      VITE_GOOGLE_MAPS_API_KEY: ${VITE_GOOGLE_MAPS_API_KEY}
+      VITE_WS_ENDPOINT: ${VITE_RESTAURANTS_WS_ENDPOINT}
+      VITE_LIVEKIT_URL: ${VITE_LIVEKIT_URL}
+      VITE_OTEL_ENDPOINT: ${VITE_OTEL_ENDPOINT}
+      VITE_REFRESH_URL: ${VITE_RESTAURANTS_REFRESH_URL}
+      VITE_LOGOUT_URL: ${VITE_RESTAURANTS_LOGOUT_URL}
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.restaurants-web.loadbalancer.server.port: "80"
+      traefik.http.routers.restaurants-web.rule: "Host(`${RESTAURANTS_HOST}`)"
+      traefik.http.routers.restaurants-web.service: restaurants-web
+
+  admin-web:
+    <<: *web
+    image: ${REGISTRY}/admin-web:${FRONTEND_VERSION}
+    environment:
+      VITE_LOGIN_URL: ${VITE_ADMIN_LOGIN_URL}
+      VITE_OTEL_ENDPOINT: ${VITE_OTEL_ENDPOINT}
+      VITE_AUTH_ENDPOINT: ${VITE_AUTH_ENDPOINT}
+      VITE_REFRESH_URL: ${VITE_ADMIN_REFRESH_URL}
+      VITE_LOGOUT_URL: ${VITE_ADMIN_LOGOUT_URL}
+      VITE_ADMIN_ENDPOINT: ${VITE_ADMIN_ENDPOINT}
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.admin-web.loadbalancer.server.port: "80"
+      traefik.http.routers.admin-web.rule: "Host(`${ADMIN_HOST}`)"
+      traefik.http.routers.admin-web.service: admin-web
+
+  client-web:
+    <<: *web
+    image: ${REGISTRY}/client-web:${FRONTEND_VERSION}
+    environment:
+      VITE_CLIENT_ENDPOINT: ${VITE_CLIENT_ENDPOINT}
+      VITE_AUTH_ENDPOINT: ${VITE_AUTH_ENDPOINT}
+      VITE_IMAGES_ENDPOINT: ${VITE_IMAGES_ENDPOINT}
+      VITE_RESTAURANTS_ENDPOINT: ${VITE_RESTAURANTS_ENDPOINT}
+      VITE_BILLING_ENDPOINT: ${VITE_BILLING_ENDPOINT}
+      VITE_RATING_ENDPOINT: ${VITE_RATING_ENDPOINT}
+      VITE_GOOGLE_MAPS_API_KEY: ${VITE_GOOGLE_MAPS_API_KEY}
+      VITE_WS_ENDPOINT: ${VITE_CLIENT_WS_ENDPOINT}
+      VITE_LOGIN_URL: ${VITE_CLIENT_LOGIN_URL}
+      VITE_LOGOUT_URL: ${VITE_CLIENT_LOGOUT_URL}
+      VITE_REFRESH_URL: ${VITE_CLIENT_REFRESH_URL}
+      VITE_OTEL_ENDPOINT: ${VITE_OTEL_ENDPOINT}
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.client-web.loadbalancer.server.port: "80"
+      traefik.http.routers.client-web.rule: "Host(`${CLIENT_HOST}`)"
+      traefik.http.routers.client-web.service: client-web
+
+  delivery-web:
+    <<: *web
+    image: ${REGISTRY}/delivery-web:${FRONTEND_VERSION}
+    environment:
+      VITE_DELIVERY_ENDPOINT: ${VITE_DELIVERY_ENDPOINT}
+      VITE_AUTH_ENDPOINT: ${VITE_AUTH_ENDPOINT}
+      VITE_LOGIN_URL: ${VITE_DELIVERY_LOGIN_URL}
+      VITE_WS_ENDPOINT: ${VITE_DELIVERY_WS_ENDPOINT}
+      VITE_OTEL_ENDPOINT: ${VITE_OTEL_ENDPOINT}
+      VITE_LOGOUT_URL: ${VITE_DELIVERY_LOGOUT_URL}
+      VITE_REFRESH_URL: ${VITE_DELIVERY_REFRESH_URL}
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.delivery-web.loadbalancer.server.port: "80"
+      traefik.http.routers.delivery-web.rule: "Host(`${DELIVERY_HOST}`)"
+      traefik.http.routers.delivery-web.service: delivery-web
+
+networks:
+  app-network:
+    name: ${APP_NETWORK:-bmf-network}
+
+volumes:
+  traefik-letsencrypt:
+  postgres-data:
+  redis-data:
+  opensearch-data:
+  lgtm-data:
+
+secrets:
+  server.crt:
+    file: ./certs/server.crt
+  server.key:
+    file: ./certs/server.key
+  ca.crt:
+    file: ./certs/ca.crt
+  client.crt:
+    file: ./certs/client.crt
+  client.key:
+    file: ./certs/client.key

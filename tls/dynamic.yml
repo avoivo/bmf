@@ -1,0 +1,10 @@
+# Used by the `https-custom` profile.
+# Serves tls/cert.pem + tls/key.pem for every host, including unknown ones, so
+# the browser never falls back to Traefik's built-in default certificate.
+# The certificate must list every hostname (API_HOST, AUTH_HOST, ...).
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /tls/cert.pem
+        keyFile: /tls/key.pem

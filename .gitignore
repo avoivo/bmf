@@ -1,0 +1,7 @@
+# Secrets and per-installation material: never commit
+.env
+certs/
+credentials/
+backups/
+tls/cert.pem
+tls/key.pem
