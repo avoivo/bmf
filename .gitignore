@@ -1,5 +1,7 @@
 # Secrets and per-installation material: never commit
 .env
+.env.*
+!.env.example
 certs/
 credentials/
 backups/
