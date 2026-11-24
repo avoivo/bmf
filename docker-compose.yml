@@ -9,13 +9,28 @@
 #                         development, or a certificate from your provider)
 #     http                plain HTTP, no certificates
 #
-#   Optional, add any:
-#     infra               local Postgres, Redis (Valkey), OpenSearch
-#                         (leave it out to use Supabase, Redis Cloud, ...)
+#   What to run, add any:
+#     backend             all backend services (HTTP, WebSocket/MCP, gRPC,
+#                         consumers)
+#     web                 the five frontend containers (leave it out to run
+#                         the frontends with pnpm)
+#
+#   Infrastructure, add any (leave out what you use elsewhere: Supabase,
+#   Redis Cloud, a stage environment, ...):
+#     infra               all three of the following
+#     postgres            local Postgres
+#     redis               local Redis (Valkey)
+#     opensearch          local OpenSearch
+#
+#   Other, add any:
 #     observability       local Grafana + OTLP collector
 #     backup              scheduled pg_dump of POSTGRES_HOST
 #
-#   e.g. COMPOSE_PROFILES=https-letsencrypt,infra
+#   e.g. COMPOSE_PROFILES=https-letsencrypt,backend,web,infra
+#        COMPOSE_PROFILES=http,backend,redis   (frontends via pnpm, rest on stage)
+#
+#   Naming a service on the command line also starts it, whatever the profiles:
+#     docker compose up -d traefik-http redis auth
 #
 #   cp .env.example .env && $EDITOR .env
 #   docker compose up -d
@@ -26,6 +41,9 @@
 name: bmf
 
 # Fail fast if a required variable is missing (nothing reads this key).
+# Compose reads the whole file whatever the profiles, so these are required
+# even when a service's profile is off (e.g. FRONTEND_VERSION=unused when you
+# run no web containers).
 x-required:
   - ${DOMAIN:?DOMAIN is required, see .env.example}
   - ${REGISTRY:?REGISTRY is required, see .env.example}
@@ -41,6 +59,7 @@ x-required:
 # ----------------------------- service templates ----------------------------
 # One template per tier. Replica counts come from the *_REPLICAS variables;
 # `--scale <service>=N` on the command line overrides them for one service.
+# Each template also sets the tier's profile: `backend` or `web`.
 
 x-service: &service
   restart: unless-stopped
@@ -54,26 +73,31 @@ x-service: &service
 
 x-http: &http
   <<: *service
+  profiles: [backend]
   deploy:
     replicas: ${HTTP_REPLICAS:-1}
 
 x-ws: &ws
   <<: *service
+  profiles: [backend]
   deploy:
     replicas: ${WS_REPLICAS:-1}
 
 x-grpc: &grpc
   <<: *service
+  profiles: [backend]
   deploy:
     replicas: ${GRPC_REPLICAS:-1}
 
 x-consumer: &consumer
   <<: *service
+  profiles: [backend]
   deploy:
     replicas: ${CONSUMER_REPLICAS:-1}
 
 x-web: &web
   <<: *service
+  profiles: [web]
   deploy:
     replicas: ${WEB_REPLICAS:-1}
 
@@ -253,16 +277,18 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
   # ======================= LOCAL INFRASTRUCTURE =======================
-  # Profile `infra`. Skip it when you use Supabase, Redis Cloud, etc.
+  # Profile `infra` starts all three; `postgres`, `redis` and `opensearch`
+  # start one each. Skip what you use elsewhere (Supabase, Redis Cloud, stage).
   # Nothing here is published to the internet; ports bind to 127.0.0.1.
-  # With it, set POSTGRES_HOST=postgres, POSTGRES_HOST_READ=postgres,
-  # REDIS_ADDR=redis:6379 and OPENSEARCH_URL=http://opensearch:9200.
+  # For each one you run locally, set POSTGRES_HOST=postgres and
+  # POSTGRES_HOST_READ=postgres, REDIS_ADDR=redis:6379, or
+  # OPENSEARCH_URL=http://opensearch:9200 in .env.
 
   # The major version is part of the data format: to change it, dump and
   # restore, do not just bump the tag.
   postgres:
     <<: *service
-    profiles: [infra]
+    profiles: [infra, postgres]
     image: ${POSTGRES_IMAGE:-postgres:17-alpine}
     command:
       - postgres
@@ -289,7 +315,7 @@ services:
   # broker (streams + consumer groups), so it persists (AOF) and never evicts.
   redis:
     <<: *service
-    profiles: [infra]
+    profiles: [infra, redis]
     image: ${REDIS_IMAGE:-valkey/valkey:8-alpine}
     command:
       - --requirepass
@@ -319,7 +345,7 @@ services:
   # The HOST needs: sysctl -w vm.max_map_count=262144 (see README).
   opensearch:
     <<: *service
-    profiles: [infra]
+    profiles: [infra, opensearch]
     image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:2.19.1}
     environment:
       discovery.type: single-node
@@ -391,6 +417,8 @@ services:
       - ./backups:/backups
 
   # =========================== BACKEND: HTTP ===========================
+  # Every backend service (HTTP, WebSocket/MCP, gRPC, consumers) has profile
+  # `backend`, set by the x-http / x-ws / x-grpc / x-consumer templates.
 
   auth:
     <<: *http
@@ -819,6 +847,8 @@ services:
       CONSUMER_GROUP: rating_consumer${CONSUMERS_VERSION:-}
 
   # ===================== FRONTEND (nginx, port 80) =====================
+  # Profile `web`. To run a frontend with pnpm instead, leave `web` out (see
+  # README, "Running part of the stack").
   # Compose names end in -web to match the registry images and to avoid
   # clashing with the backend services of the same name. Each app is served
   # on its own host (${AUTH_HOST}, ${RESTAURANTS_HOST}, ...). VITE_* values

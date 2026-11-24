@@ -16,11 +16,26 @@ COMPOSE_PROFILES=https-letsencrypt,infra
 | `https-custom` | Local development with trusted HTTPS (mkcert), or a certificate from your provider | `tls/cert.pem` and `tls/key.pem` covering every host |
 | `http` | Local development without certificates, or TLS handled upstream | Nothing. Use `http://` and `ws://` in every URL |
 
-**Optional parts: add any**
+**What to run: add any**
+
+| Profile | Starts | Leave it out when |
+| --- | --- | --- |
+| `backend` | All backend services: HTTP APIs, WebSocket/MCP, gRPC and consumers | You only need the frontends or the infrastructure |
+| `web` | The five frontend containers (nginx) | You run the frontends with `pnpm` |
+
+**Infrastructure: add any**
+
+| Profile | Starts | Leave it out when |
+| --- | --- | --- |
+| `infra` | All three of the following | You use Supabase, Redis Cloud, a stage environment, etc. |
+| `postgres` | Local PostgreSQL only | The database is elsewhere |
+| `redis` | Local Redis-compatible broker (Valkey) only | Redis is elsewhere |
+| `opensearch` | Local OpenSearch only | Search is elsewhere |
+
+**Other optional parts: add any**
 
 | Profile | Adds | Skip it when |
 | --- | --- | --- |
-| `infra` | Local PostgreSQL, Redis-compatible broker (Valkey) and OpenSearch | You use Supabase, Redis Cloud, etc. |
 | `observability` | Local Grafana, Loki, Tempo and Prometheus with an OTLP endpoint | You send telemetry elsewhere, or nowhere |
 | `backup` | Scheduled `pg_dump` of `POSTGRES_HOST` into `./backups` | You back up another way |
 
@@ -28,24 +43,28 @@ Common setups:
 
 | Situation | `COMPOSE_PROFILES` |
 | --- | --- |
-| Production VM, everything local | `https-letsencrypt,infra,backup` |
-| Production VM, Supabase and cloud Redis | `https-letsencrypt` |
-| Laptop, local infra, trusted HTTPS | `https-custom,infra` |
-| Laptop, Supabase, no certificates | `http` |
+| Production VM, everything local | `https-letsencrypt,backend,web,infra,backup` |
+| Production VM, Supabase and cloud Redis | `https-letsencrypt,backend,web` |
+| Laptop, everything local, trusted HTTPS | `https-custom,backend,web,infra` |
+| Laptop, Supabase, no certificates | `http,backend,web` |
+| Laptop, backend and local Redis, Postgres and OpenSearch on stage, frontends with pnpm | `http,backend,redis` (see [Running part of the stack](#running-part-of-the-stack)) |
 
-If you forget the TLS profile, no proxy starts and nothing answers on ports 80 and 443. Check with `docker compose ps`.
+If you forget the TLS profile, no proxy starts and nothing answers on ports 80 and 443. If you forget `backend` or `web`, those services don't start, and the infrastructure profiles start only what they name. Check with `docker compose ps`.
+
+> **Upgrading an existing installation:** `backend` and `web` are new. Services of those tiers used to start whatever the profiles, so add `backend,web` to `COMPOSE_PROFILES` in your `.env` before the next `docker compose up -d`.
 
 ## What runs
 
-| Tier | Services | Reachable from outside? |
-| --- | --- | --- |
-| Backend HTTP | `auth`, `admin`, `restaurants`, `client`, `delivery`, `images`, `subscription`, `billing`, `rating` | yes, on `API_HOST`, by path |
-| Backend WebSocket / MCP | `client-ws`, `restaurants-ws`, `delivery-ws`, `restaurants-mcp`, `images-mcp` | yes, on `API_HOST`, by path |
-| Backend gRPC | `auth-grpc`, `client-grpc`, `restaurants-grpc`, `subscription-grpc`, `billing-grpc`, `notification-grpc`, `rating-grpc` | no, internal mTLS only |
-| Backend consumers | `address-`, `order-`, `restaurants-`, `menu-`, `auth-`, `notification-`, `subscription-`, `billing-`, `rating-consumer` | no |
-| Frontend | `auth-web`, `restaurants-web`, `admin-web`, `client-web`, `delivery-web` | yes, one host each |
-| Proxy | one of `traefik-letsencrypt`, `traefik-custom`, `traefik-http` | yes |
-| Infra (optional) | `postgres`, `redis`, `opensearch`, `otel-lgtm`, `postgres-backup` | no (Postgres and Grafana on `127.0.0.1` only) |
+| Tier | Services | Profile | Reachable from outside? |
+| --- | --- | --- | --- |
+| Backend HTTP | `auth`, `admin`, `restaurants`, `client`, `delivery`, `images`, `subscription`, `billing`, `rating` | `backend` | yes, on `API_HOST`, by path |
+| Backend WebSocket / MCP | `client-ws`, `restaurants-ws`, `delivery-ws`, `restaurants-mcp`, `images-mcp` | `backend` | yes, on `API_HOST`, by path |
+| Backend gRPC | `auth-grpc`, `client-grpc`, `restaurants-grpc`, `subscription-grpc`, `billing-grpc`, `notification-grpc`, `rating-grpc` | `backend` | no, internal mTLS only |
+| Backend consumers | `address-`, `order-`, `restaurants-`, `menu-`, `auth-`, `notification-`, `subscription-`, `billing-`, `rating-consumer` | `backend` | no |
+| Frontend | `auth-web`, `restaurants-web`, `admin-web`, `client-web`, `delivery-web` | `web` | yes, one host each |
+| Proxy | one of `traefik-letsencrypt`, `traefik-custom`, `traefik-http` | the TLS profile | yes |
+| Infra (optional) | `postgres`, `redis`, `opensearch` | `infra`, or `postgres` / `redis` / `opensearch` | no (Postgres on `127.0.0.1` only) |
+| Optional extras | `otel-lgtm`, `postgres-backup` | `observability`, `backup` | no (Grafana on `127.0.0.1` only) |
 
 Images are `${REGISTRY}/<service>:${BACKEND_VERSION}` for the backend and `${REGISTRY}/<name>-web:${FRONTEND_VERSION}` for the frontend, the same names `make build push` produces.
 
@@ -116,9 +135,9 @@ For local development, Chrome, Firefox and `curl` resolve `*.localhost` to your 
 
 ## Databases and other services
 
-Use the local `infra` profile or external services, per service. Section 4 of `.env.example` shows both.
+Use the local profiles (`infra` for all three, or `postgres`, `redis`, `opensearch` one by one) or external services, per service. You can mix them, for example local Redis with Postgres and OpenSearch on stage. Section 4 of `.env.example` shows both.
 
-**Local (`infra`)**: set `POSTGRES_HOST=postgres`, `POSTGRES_HOST_READ=postgres`, `REDIS_ADDR=redis:6379`, `OPENSEARCH_URL=http://opensearch:9200`.
+**Local (`infra`, or the single profile)**: set `POSTGRES_HOST=postgres`, `POSTGRES_HOST_READ=postgres`, `REDIS_ADDR=redis:6379`, `OPENSEARCH_URL=http://opensearch:9200`.
 
 | Service | Image (override with) | Notes |
 | --- | --- | --- |
@@ -139,6 +158,8 @@ docker compose up -d                                              # the rest, on
 docker compose --profile '*' down                                 # stop everything, whatever profiles are active
 ```
 
+More ways to choose what runs are in [Running part of the stack](#running-part-of-the-stack).
+
 `docker compose down` only removes services of the active profiles, hence the `'*'` form. Data lives in named volumes (`postgres-data`, `redis-data`, `opensearch-data`, `lgtm-data`); `down` keeps them and `down -v` deletes them.
 
 **Backups.** With the `backup` profile, dumps go to `./backups` on the same machine, so also copy that folder off the host (rclone, rsync, object storage). Restore:
@@ -147,6 +168,92 @@ docker compose --profile '*' down                                 # stop everyth
 docker compose exec -T postgres \
   pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists < backups/<file>.dump
 ```
+
+## Running part of the stack
+
+Each tier has its own profile (`backend`, `web`, and `infra` or one of `postgres`, `redis`, `opensearch`), so one file covers everything local, backend only, or a few local pieces with the rest on another environment such as stage.
+
+### Choosing what runs
+
+```sh
+# persistent: one line in .env
+COMPOSE_PROFILES=http,backend,redis
+
+# one command only (a value in your shell wins over .env)
+COMPOSE_PROFILES=http,backend,postgres docker compose up -d
+
+# by service name: naming a service starts it, whatever the profiles
+docker compose up -d traefik-http redis auth auth-grpc
+
+# what would the current selection start?
+docker compose config --services
+```
+
+- Changing the selection does not stop what is already running. Run `docker compose --profile '*' down`, then start again.
+- When you name services, only those start. Include the proxy (`traefik-http`, `traefik-custom` or `traefik-letsencrypt`) and any infrastructure they need. There is no `depends_on`.
+- Compose reads the whole file whatever the profiles, so every variable in the `x-required` list must be set. Without `web`, use `FRONTEND_VERSION=unused`.
+
+### Backend in containers, infrastructure elsewhere (for example stage)
+
+Start only what you want locally and point the rest at the other environment. Example: backend and Redis here, Postgres and OpenSearch on stage.
+
+```sh
+COMPOSE_PROFILES=http,backend,redis
+
+REDIS_ADDR=redis:6379
+REDIS_PASSWORD=<local password>
+REDIS_TLS=false
+
+POSTGRES_HOST=<stage write host>
+POSTGRES_HOST_READ=<stage read host>
+POSTGRES_DB_PORT=<stage port>
+OPENSEARCH_URL=<stage url>
+```
+
+`POSTGRES_USER`, `POSTGRES_PWD`, `POSTGRES_DB` and the optional `POSTGRES_DB_*` tuning also come from stage. Before you point local containers at a shared environment:
+
+- **Keys:** `PERSONAL_INFORMATION_ENCRYPTION_KEY`, `JWT_KEY`, `JWE_KEY` and the other secrets must be stage's values, otherwise stage data cannot be decrypted and stage tokens are not accepted.
+- **Third parties:** use test Stripe keys (`sk_test_...`) and a sandbox SMTP server. Local consumers act on whatever you trigger.
+- **Version:** set `BACKEND_VERSION` to a version that matches the schema stage has been migrated to. Nothing here runs migrations.
+- **Redis state:** the local broker is empty and separate from stage's. Anything held only in stage's Redis (streams, caches) does not exist locally.
+
+### Frontends with pnpm
+
+Leave `web` out and run each app's dev server instead. Traefik keeps serving the API and each app's `/<app>/login`, `/logout`, `/refresh` and `/auth` paths on port 80. On port 80 everything else under an app host answers `404`, because no web container runs: open the dev server's URL instead.
+
+Keep the same `*.localhost` hostnames and only add a port. Cookies are same-site across ports, so login behaves as before, but CORS compares full origins, so the dev origins must be allowed. Pick one port per app, for example:
+
+| App | Dev server URL |
+| --- | --- |
+| auth | `http://auth.localhost:5170` |
+| restaurants | `http://restaurants.localhost:5171` |
+| admin | `http://admin.localhost:5172` |
+| client | `http://client.localhost:5173` |
+| delivery | `http://delivery.localhost:5174` |
+
+In the compose `.env`, the backend redirects the browser to `AUTH_URL` and the `*_WEB_APP_URL` values, so they point at the dev servers. The `*_AUTH_URL` callbacks stay on Traefik (port 80):
+
+```sh
+AUTH_URL=http://auth.localhost:5170/
+RESTAURANTS_WEB_APP_URL=http://restaurants.localhost:5171/
+ADMIN_WEB_APP_URL=http://admin.localhost:5172/
+CLIENT_WEB_APP_URL=http://client.localhost:5173/
+DELIVERY_WEB_APP_URL=http://delivery.localhost:5174/
+
+# same delimiter as your current value
+ALLOWED_ORIGINS=http://auth.localhost:5170 http://restaurants.localhost:5171 http://admin.localhost:5172 http://client.localhost:5173 http://delivery.localhost:5174
+```
+
+Then, in each frontend repo:
+
+```sh
+# .env.local: the same VITE_* values as in the compose .env (they point at Traefik, not at the dev server)
+pnpm dev --port 5173
+```
+
+- Check `REDIRECT_INFO_MAP`: if it contains app URLs, they need the dev ports too.
+- If Vite answers "Blocked request. This host is not allowed", add the hostname to `server.allowedHosts`.
+- If login cookies are marked `Secure` and the browser drops them over plain HTTP, switch to `https-custom` and serve Vite with the same mkcert certificate.
 
 ## Routing
 
@@ -202,6 +309,7 @@ To roll back, set the previous tags and repeat. Run database migrations separate
 ## Differences from the original compose files
 
 - **One file, selected by profiles**, instead of separate infra and local-override files. The files `docker-compose.infra.yml`, `docker-compose.local.yml` and `traefik/` no longer exist. If you ran the old infra file, stop it first (`docker compose -f docker-compose.infra.yml down`) and note that its volumes were named `bmf-infra_*`; the new ones are `bmf_*`.
+- **Profiles per tier:** `backend` and `web` select the backend and frontend services, and `postgres`, `redis` and `opensearch` start one piece of local infrastructure each (`infra` is still all three). Add `backend,web` to `COMPOSE_PROFILES` in existing installations.
 - **gRPC addresses** are Docker DNS names (`auth-grpc:50050`) instead of `host.docker.internal:<port>`.
 - **`admin` mounts the mTLS secrets.** The original prod file set the certificate paths but never mounted them.
 - **`LOG_LEVEL`** is a variable everywhere (`auth` and `auth-grpc` had `TRACE` hard-coded). **`THROTTLING_*`** are variables with the same defaults (50 / 10).
@@ -224,6 +332,10 @@ To roll back, set the previous tags and repeat. Run database migrations separate
 | --- | --- |
 | Browser forces `https://` although you use the `http` profile | Not the server: `curl -I http://<host>` shows no redirect. The browser remembers an earlier permanent redirect or HSTS, or its HTTPS-upgrade feature is on. Open the site in a private window to confirm, then: in Brave set `brave://settings/shields` > "Upgrade connections to HTTPS" to Disabled (or turn it off per site in the Shields panel); clear the site's cached files; and delete the hosts at `brave://net-internals/#hsts` (Chrome: `chrome://net-internals/#hsts`). Or use `https-custom` and avoid the problem. |
 | Nothing answers on ports 80 and 443 | No TLS profile in `COMPOSE_PROFILES`. Add one of `https-letsencrypt`, `https-custom`, `http`. |
+| Only the proxy (or only infra) starts, no applications | `backend` and/or `web` missing from `COMPOSE_PROFILES`. Check with `docker compose config --services`. |
+| `404 page not found` on `http://<app>.localhost/` while running the frontend with pnpm | Expected: no web container serves port 80. Open the dev server URL (`http://<app>.localhost:<port>`). |
+| After login you land on `http://<app>.localhost/` (404) instead of the dev server | `*_WEB_APP_URL` (or `AUTH_URL`) still points at port 80. Set them to the dev server URLs. |
+| CORS error from a pnpm dev server | The dev origin, with its port, is missing from `ALLOWED_ORIGINS`. |
 | Browser shows `TRAEFIK DEFAULT CERT` on localhost | You are on `https-letsencrypt`, which cannot issue certificates for localhost. Use `https-custom` (mkcert) or `http`. |
 | Same message on a server | Certificate not issued yet. Check `docker compose logs traefik-letsencrypt`, DNS for that host, and port 443. |
 | `https-custom`: certificate name mismatch | The certificate does not list that hostname. Regenerate it with every host. |
@@ -231,7 +343,7 @@ To roll back, set the previous tags and repeat. Run database migrations separate
 | `pull access denied` / `unauthorized` | Registry login missing or the account lacks the Reader role. |
 | `404 page not found` from Traefik | Wrong host or path. Check the host against the `*_HOST` values and the path against the routing table. |
 | Login/refresh works in dev but not here | `API_HOST` and the app hosts are on different registrable domains, so cookies are cross-site. |
-| Services can't reach `postgres` / `redis` / `opensearch` | `infra` is not in `COMPOSE_PROFILES`, or the host variables still point elsewhere. |
+| Services can't reach `postgres` / `redis` / `opensearch` | Neither `infra` nor the single profile (`postgres`, `redis`, `opensearch`) is in `COMPOSE_PROFILES`, or the host variables still point elsewhere. |
 | `opensearch` restarts: `vm.max_map_count ... is too low` | Set `vm.max_map_count=262144` on the host. |
 | gRPC `certificate` / `permission denied` errors | Certificates in `./certs` unreadable in the container, or not generated from the same CA. |
 | Frontend ignores `VITE_*` changes | The image reads them at build time rather than container start. Rebuild with `BUILD_ARGS`, or confirm the image's entrypoint injects runtime variables. |
